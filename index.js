@@ -93,6 +93,11 @@ app.post("/upload", upload.single("image"), async (req, res) => {
   }
 });
 
+// Root Endpoint
+app.get("/", (req, res) => {
+  res.json({ message: "Welcome to the Face Service API" });
+});
+
 // Store Face in Pinecone with Name
 app.post("/save-face", async (req, res) => {
   const { name, embedding } = req.body;
