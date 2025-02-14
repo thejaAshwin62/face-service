@@ -7,6 +7,7 @@ import canvas from "canvas";
 import { HfInference } from "@huggingface/inference";
 import { Pinecone } from "@pinecone-database/pinecone";
 import path from "path";
+import cors from "cors"; // Import cors
 
 // Setup face-api.js with node-canvas
 const { Image, Canvas, ImageData } = canvas;
@@ -15,6 +16,7 @@ faceapi.env.monkeyPatch({ Image, Canvas, ImageData });
 // Express App
 const app = express();
 app.use(express.json());
+app.use(cors({ origin: "*" })); // Allow all origins (for testing)
 
 // Hugging Face Inference API
 const hf = new HfInference(process.env.HF_ACCESS_TOKEN);
