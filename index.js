@@ -24,7 +24,8 @@ const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
 const index = pinecone.index(process.env.PINECONE_INDEX); // Fixed reference
 
 // Image Upload Configuration
-const upload = multer({ dest: "uploads/" });
+// const upload = multer({ dest: "uploads/" });
+const upload = multer({ dest: "/tmp" }); // Store image temporarily in /tmp
 
 // Load Face Detection Models
 const modelPath = path.resolve("models");
@@ -59,17 +60,37 @@ const getEmbedding = async (text) => {
 };
 
 // Upload & Extract Face Embeddings
+// app.post("/upload", upload.single("image"), async (req, res) => {
+//   const imagePath = req.file.path;
+//   const faceEmbeddings = await detectFaces(imagePath);
+
+//   if (faceEmbeddings.length === 0) {
+//     await fs.remove(imagePath); // Clean up the uploaded file
+//     return res.json({ message: "No face detected" });
+//   }
+
+//   res.json({ embedding: Array.from(faceEmbeddings[0]) });
+//   await fs.remove(imagePath); // Clean up the uploaded file
+// });
+
 app.post("/upload", upload.single("image"), async (req, res) => {
-  const imagePath = req.file.path;
-  const faceEmbeddings = await detectFaces(imagePath);
+  const imagePath = req.file.path; // Temporary storage path
 
-  if (faceEmbeddings.length === 0) {
-    await fs.remove(imagePath); // Clean up the uploaded file
-    return res.json({ message: "No face detected" });
+  try {
+    const faceEmbeddings = await detectFaces(imagePath);
+
+    if (faceEmbeddings.length === 0) {
+      await fs.remove(imagePath); // Delete file after processing
+      return res.json({ message: "No face detected" });
+    }
+
+    res.json({ embedding: Array.from(faceEmbeddings[0]) });
+  } catch (error) {
+    console.error("Error processing image:", error);
+    res.status(500).json({ message: "Internal server error" });
+  } finally {
+    await fs.remove(imagePath); // Always delete the file after processing
   }
-
-  res.json({ embedding: Array.from(faceEmbeddings[0]) });
-  await fs.remove(imagePath); // Clean up the uploaded file
 });
 
 // Store Face in Pinecone with Name
