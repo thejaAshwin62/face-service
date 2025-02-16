@@ -141,8 +141,11 @@ app.post("/match-face", async (req, res) => {
       })
     );
 
-    if (results.matches.length > 0) {
-      res.json({ match: results.matches[0].metadata.name });
+    if (results.matches.length > 0 && results.matches[0].score >= 0.85) {
+      res.json({
+        match: results.matches[0].metadata.name,
+        score: results.matches[0].score,
+      });
     } else {
       res.json({ message: "No match found" });
     }
