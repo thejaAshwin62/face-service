@@ -7,7 +7,10 @@ import canvas from "canvas";
 import { HfInference } from "@huggingface/inference";
 import { Pinecone } from "@pinecone-database/pinecone";
 import path from "path";
-import cors from "cors"; // Import cors
+import cors from "cors";
+import winston from "winston";
+import sharp from "sharp";
+import NodeCache from "node-cache";
 
 // Setup face-api.js with node-canvas
 const { Image, Canvas, ImageData } = canvas;
@@ -15,36 +18,95 @@ faceapi.env.monkeyPatch({ Image, Canvas, ImageData });
 
 // Express App
 const app = express();
-app.use(express.json());
-app.use(cors({ origin: "*" })); // Allow all origins (for testing)
+app.use(express.json({ limit: "2mb" })); // Reduced JSON size limit
+app.use(cors({ origin: "*" }));
+
+// Configure Winston Logger with reduced verbosity
+const logger = winston.createLogger({
+  level: "info",
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({
+      filename: "logs/app.log",
+      maxsize: 5242880, // 5MB
+      maxFiles: 5,
+    }),
+  ],
+});
+
+// Streamlined logging middleware
+app.use((req, res, next) => {
+  logger.info({
+    message: "Request",
+    method: req.method,
+    url: req.url,
+  });
+
+  const originalSend = res.send;
+  res.send = function (body) {
+    logger.info({
+      message: "Response",
+      method: req.method,
+      url: req.url,
+      statusCode: res.statusCode,
+    });
+    return originalSend.call(this, body);
+  };
+
+  next();
+});
 
 // Hugging Face Inference API
 const hf = new HfInference(process.env.HF_ACCESS_TOKEN);
 
 // Pinecone Initialization
 const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
-const index = pinecone.index(process.env.PINECONE_INDEX); // Fixed reference
+const index = pinecone.index(process.env.PINECONE_INDEX);
 
-// Configure multer for memory storage instead of disk
+// Configure multer with reduced file size
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
+    fileSize: 2 * 1024 * 1024, // 2MB limit (reduced from 5MB)
   },
 });
 
-// Cleanup middleware
+// Improved cache with longer TTL
+const imageCache = new NodeCache({
+  stdTTL: 1800, // 30 minutes (increased from 10 minutes)
+  checkperiod: 600, // Check for expired keys every 10 minutes
+  useClones: false, // Don't clone objects (better performance)
+  maxKeys: 100, // Limit cache size
+});
+
+// More aggressive image optimization
+const optimizeImage = async (buffer) => {
+  return sharp(buffer)
+    .resize(400, 400, {
+      // Increased from 320x320 to preserve more details
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .jpeg({
+      quality: 80, // Increased quality to preserve details
+      progressive: true,
+    })
+    .toBuffer();
+};
+
+// Cleanup middleware (more efficient)
 const cleanup = async (req, res, next) => {
-  res.on("finish", async () => {
-    if (req.file && req.file.path) {
-      try {
-        await fs.remove(req.file.path);
-        console.log("Cleaned up:", req.file.path);
-      } catch (error) {
-        console.error("Cleanup error:", error);
-      }
-    }
-  });
+  if (req.file && req.file.path) {
+    res.on("finish", () => {
+      fs.remove(req.file.path).catch((err) =>
+        logger.error("Cleanup error:", err)
+      );
+    });
+  }
   next();
 };
 
@@ -53,51 +115,122 @@ app.use(cleanup);
 // Load Face Detection Models
 const modelPath = path.resolve("models");
 const loadModels = async () => {
-  await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
-  await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath);
-  await faceapi.nets.faceRecognitionNet.loadFromDisk(modelPath);
+  try {
+    // Load all required models
+    await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
+    await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath); // Added back
+    await faceapi.nets.faceRecognitionNet.loadFromDisk(modelPath);
+    logger.info("✅ Models loaded successfully");
+  } catch (error) {
+    logger.error("Failed to load models:", error);
+    process.exit(1);
+  }
 };
 
-loadModels().then(() => console.log("✅ Models loaded successfully"));
-
-// Function to Extract Face Embeddings (Reduce to 128 Dimensions)
+// Optimized face detection
 const detectFaces = async (buffer) => {
-  const img = await canvas.loadImage(buffer);
-  const detections = await faceapi
-    .detectAllFaces(img)
-    .withFaceLandmarks()
-    .withFaceDescriptors();
+  try {
+    const img = await canvas.loadImage(buffer);
 
-  return detections.map((d) => d.descriptor.slice(0, 128)); // Reduce to 128D
+    // More sensitive detection options
+    const detectionOptions = new faceapi.SsdMobilenetv1Options({
+      minConfidence: 0.1, // Much lower threshold to detect more faces
+      maxResults: 3, // Look for multiple faces and take the best one
+    });
+
+    // Use all faces detection to find any possible faces
+    const detections = await faceapi
+      .detectAllFaces(img, detectionOptions)
+      .withFaceLandmarks() // Re-enable landmarks to help with difficult faces
+      .withFaceDescriptors();
+
+    if (detections.length === 0) {
+      logger.info("No faces detected in image");
+      return [];
+    }
+
+    // Sort by detection confidence and take the highest
+    detections.sort((a, b) => b.detection.score - a.detection.score);
+    return [detections[0].descriptor.slice(0, 128)];
+  } catch (error) {
+    logger.error("Face detection error:", error);
+    return [];
+  }
 };
 
-// Convert Name to Vector (Ensure 128D)
+// Optimized embedding function
 const getEmbedding = async (text) => {
-  const output = await hf.featureExtraction({
-    model: "intfloat/multilingual-e5-large-instruct",
-    inputs: text,
-    provider: "hf-inference",
-  });
+  try {
+    const cacheKey = `text_${text.substring(0, 20)}`;
+    const cached = imageCache.get(cacheKey);
+    if (cached) return cached;
 
-  return output.slice(0, 128); // Ensure 128D
+    const output = await hf.featureExtraction({
+      model: "intfloat/multilingual-e5-large-instruct",
+      inputs: text,
+      provider: "hf-inference",
+    });
+
+    const result = output.slice(0, 128);
+    imageCache.set(cacheKey, result);
+    return result;
+  } catch (error) {
+    logger.error("Error getting embedding:", error);
+    throw error;
+  }
 };
 
-// Upload & Extract Face Embeddings
+// Highly optimized upload endpoint
 app.post("/upload", upload.single("image"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: "No image provided" });
   }
 
   try {
-    const faceEmbeddings = await detectFaces(req.file.buffer);
+    // Generate efficient cache key
+    const cacheKey = Buffer.from(req.file.buffer)
+      .toString("base64")
+      .substring(0, 20);
 
-    if (faceEmbeddings.length === 0) {
+    // Check cache first
+    const cachedResult = imageCache.get(cacheKey);
+    if (cachedResult) {
+      return res.json({ embedding: cachedResult });
+    }
+
+    // Set shorter timeout
+    const timeout = setTimeout(() => {
+      return res.status(408).json({ message: "Request timeout" });
+    }, 10000); // 10 second timeout (reduced from 30s)
+
+    // Validate file size
+    if (req.file.size > 2 * 1024 * 1024) {
+      clearTimeout(timeout);
+      return res
+        .status(400)
+        .json({ message: "Image too large, max 2MB allowed" });
+    }
+
+    // Optimize image more aggressively
+    const optimizedBuffer = await optimizeImage(req.file.buffer);
+
+    // Process face detection with optimized function
+    const faceEmbeddings = await detectFaces(optimizedBuffer);
+
+    clearTimeout(timeout);
+
+    if (!faceEmbeddings || faceEmbeddings.length === 0) {
       return res.json({ message: "No face detected" });
     }
 
-    res.json({ embedding: Array.from(faceEmbeddings[0]) });
+    const result = Array.from(faceEmbeddings[0]);
+
+    // Cache the result
+    imageCache.set(cacheKey, result);
+
+    res.json({ embedding: result });
   } catch (error) {
-    console.error("Error processing image:", error);
+    logger.error("Error processing image:", error);
     res.status(500).json({
       message: "Error processing image",
       error: error.message,
@@ -110,7 +243,7 @@ app.get("/", (req, res) => {
   res.json({ message: "Welcome to the Face Service API" });
 });
 
-// Store Face in Pinecone with Name
+// Store Face in Pinecone with Name (optimized)
 app.post("/save-face", async (req, res) => {
   const { name, embedding } = req.body;
 
@@ -118,12 +251,17 @@ app.post("/save-face", async (req, res) => {
     return res.status(400).json({ message: "Invalid input or embedding size" });
   }
 
-  await index.upsert([{ id: name, values: embedding, metadata: { name } }]);
-  res.json({ message: "✅ Face saved in Pinecone!" });
+  try {
+    await index.upsert([{ id: name, values: embedding, metadata: { name } }]);
+    res.json({ message: "✅ Face saved in Pinecone!" });
+  } catch (error) {
+    logger.error("Error saving face:", error);
+    res.status(500).json({ message: "Error saving face to database" });
+  }
 });
 
-// Helper function to retry async operations
-const retryAsync = async (fn, retries = 3, delay = 1000) => {
+// Helper function to retry async operations (optimized)
+const retryAsync = async (fn, retries = 2, delay = 500) => {
   for (let i = 0; i < retries; i++) {
     try {
       return await fn();
@@ -134,7 +272,7 @@ const retryAsync = async (fn, retries = 3, delay = 1000) => {
   }
 };
 
-// Match Face from Pinecone
+// Match Face from Pinecone (optimized)
 app.post("/match-face", async (req, res) => {
   const { embedding } = req.body;
 
@@ -160,20 +298,30 @@ app.post("/match-face", async (req, res) => {
       res.json({ message: "No match found" });
     }
   } catch (error) {
-    console.error("Error querying Pinecone:", error);
+    logger.error("Error querying Pinecone:", error);
     res.status(500).json({ message: "Internal server error" });
   }
 });
 
-// Error handling middleware
+// Error handling middleware (improved)
 app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err);
+  logger.error("Unhandled error:", err);
   res.status(500).json({ message: "Internal server error" });
 });
 
-// Start the Server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+// Initialize server
+const startServer = async () => {
+  try {
+    await loadModels();
+    const PORT = process.env.PORT || 5000;
+    app.listen(PORT, () => logger.info(`✅ Server running on port ${PORT}`));
+  } catch (error) {
+    logger.error("Failed to start server:", error);
+    process.exit(1);
+  }
+};
+
+startServer();
 
 // Export for production (Render)
 export default app;

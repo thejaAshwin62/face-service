@@ -22,7 +22,9 @@
     "face-api.js": "*",
     "fs-extra": "*",
     "multer": "*",
-    "winston": "^3.17.0"
+    "winston": "^3.17.0",
+    "sharp": "^0.32.6",
+    "node-cache": "^5.1.2"
   },
   "devDependencies": {
     "nodemon": "*"
