@@ -16,7 +16,13 @@ faceapi.env.monkeyPatch({ Image, Canvas, ImageData });
 // Express App
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: "*" })); // Allow all origins (for testing)
+app.use(cors({ origin: "*" })); // Allow all origins (for testing))
+
+// Add request logging middleware
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
 
 // Hugging Face Inference API
 const hf = new HfInference(process.env.HF_ACCESS_TOKEN);
@@ -34,12 +40,22 @@ const upload = multer({
 // Load Face Detection Models
 const modelPath = path.join(process.cwd(), "models");
 const loadModels = async () => {
-  await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
-  await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath);
-  await faceapi.nets.faceRecognitionNet.loadFromDisk(modelPath);
+  try {
+    console.log("Loading face-api.js models from:", modelPath);
+    console.log("Files in models directory:", fs.existsSync(modelPath) ? fs.readdirSync(modelPath) : "Directory not found");
+    
+    await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
+    await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath);
+    await faceapi.nets.faceRecognitionNet.loadFromDisk(modelPath);
+    console.log("✅ Models loaded successfully");
+  } catch (error) {
+    console.error("❌ Error loading models:", error);
+    // Continue execution even if models fail to load
+  }
 };
 
-loadModels().then(() => console.log("✅ Models loaded successfully"));
+// Load models but don't block server startup
+loadModels();
 
 // Function to Extract Face Embeddings (Reduce to 128 Dimensions)
 const detectFaces = async (imagePath) => {
@@ -81,7 +97,16 @@ app.post("/upload", upload.single("image"), async (req, res) => {
   }
 
   try {
+    console.log("Processing image upload, size:", req.file.size);
+    
+    // Check if models are loaded
+    if (!faceapi.nets.ssdMobilenetv1.isLoaded) {
+      console.log("Models not loaded, attempting to load...");
+      await loadModels();
+    }
+    
     const faceEmbeddings = await detectFacesFromBuffer(req.file.buffer);
+    console.log(`Detected ${faceEmbeddings.length} faces`);
 
     if (faceEmbeddings.length === 0) {
       return res.json({ message: "No face detected" });
@@ -90,7 +115,10 @@ app.post("/upload", upload.single("image"), async (req, res) => {
     res.json({ embedding: Array.from(faceEmbeddings[0]) });
   } catch (error) {
     console.error("Error processing image:", error);
-    res.status(500).json({ message: "Internal server error" });
+    res.status(500).json({ 
+      message: "Error processing image", 
+      error: error.message 
+    });
   }
 });
 
@@ -103,12 +131,27 @@ app.get("/", (req, res) => {
 app.post("/save-face", async (req, res) => {
   const { name, embedding } = req.body;
 
-  if (!name || !embedding || embedding.length !== 128) {
-    return res.status(400).json({ message: "Invalid input or embedding size" });
+  if (!name || !embedding) {
+    return res.status(400).json({ message: "Name and embedding are required" });
+  }
+  
+  if (embedding.length !== 128) {
+    console.log(`Warning: Embedding dimension is ${embedding.length}, expected 128`);
+    return res.status(400).json({ message: "Embedding must be 128 dimensions" });
   }
 
-  await index.upsert([{ id: name, values: embedding, metadata: { name } }]);
-  res.json({ message: "✅ Face saved in Pinecone!" });
+  try {
+    console.log(`Saving face for: ${name}`);
+    await index.upsert([{ id: name, values: embedding, metadata: { name } }]);
+    console.log(`Successfully saved face for: ${name}`);
+    res.json({ message: "✅ Face saved in Pinecone!" });
+  } catch (error) {
+    console.error("Error saving face to Pinecone:", error);
+    res.status(500).json({ 
+      message: "Error saving face", 
+      error: error.message 
+    });
+  }
 });
 
 // Helper function to retry async operations
@@ -127,11 +170,17 @@ const retryAsync = async (fn, retries = 3, delay = 1000) => {
 app.post("/match-face", async (req, res) => {
   const { embedding } = req.body;
 
-  if (!embedding || embedding.length !== 128) {
-    return res.status(400).json({ message: "Embedding dimension must be 128" });
+  if (!embedding) {
+    return res.status(400).json({ message: "Embedding is required" });
+  }
+  
+  if (embedding.length !== 128) {
+    console.log(`Warning: Embedding dimension is ${embedding.length}, expected 128`);
+    return res.status(400).json({ message: "Embedding must be 128 dimensions" });
   }
 
   try {
+    console.log("Querying Pinecone for face match");
     const results = await retryAsync(() =>
       index.query({
         vector: embedding,
@@ -139,6 +188,7 @@ app.post("/match-face", async (req, res) => {
         includeMetadata: true,
       })
     );
+    console.log(`Found ${results.matches.length} matches`);
 
     if (results.matches.length > 0 && results.matches[0].score >= 0.85) {
       res.json({
@@ -150,8 +200,35 @@ app.post("/match-face", async (req, res) => {
     }
   } catch (error) {
     console.error("Error querying Pinecone:", error);
-    res.status(500).json({ message: "Internal server error" });
+    res.status(500).json({ 
+      message: "Error matching face", 
+      error: error.message 
+    });
   }
+});
+
+// Add a /debug endpoint to check environment and configurations
+app.get("/debug", (req, res) => {
+  const safeEnvVars = {
+    NODE_ENV: process.env.NODE_ENV,
+    PORT: process.env.PORT,
+    HF_TOKEN_SET: !!process.env.HF_ACCESS_TOKEN,
+    PINECONE_KEY_SET: !!process.env.PINECONE_API_KEY,
+    PINECONE_INDEX: process.env.PINECONE_INDEX,
+    PINECONE_REGION: process.env.PINECONE_REGION,
+    CWD: process.cwd(),
+    MODEL_PATH: modelPath,
+    MODEL_PATH_EXISTS: fs.existsSync(modelPath)
+  };
+  
+  res.json({
+    environment: safeEnvVars,
+    serverInfo: {
+      platform: process.platform,
+      nodeVersion: process.version,
+      memoryUsage: process.memoryUsage()
+    }
+  });
 });
 
 // Error handling middleware
