@@ -19,11 +19,5 @@
     "PINECONE_INDEX": "@pinecone_index",
     "PINECONE_HOST": "@pinecone_host",
     "PINECONE_REGION": "@pinecone_region"
-  },
-  "functions": {
-    "api/*.js": {
-      "memory": 1024,
-      "maxDuration": 10
-    }
   }
 }
