@@ -90,6 +90,49 @@ const getEmbedding = async (text) => {
   return output.slice(0, 128); // Ensure 128D
 };
 
+// Enhanced retry mechanism with exponential backoff
+const retryAsync = async (fn, options = {}) => {
+  const {
+    retries = 3,
+    initialDelay = 1000,
+    maxDelay = 10000,
+    factor = 2,
+    timeout = 30000
+  } = options;
+
+  const timeoutPromise = (ms, message) =>
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error(message)), ms)
+    );
+
+  const executeWithTimeout = async () => {
+    return Promise.race([
+      fn(),
+      timeoutPromise(timeout, 'Operation timed out')
+    ]);
+  };
+
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      return await executeWithTimeout();
+    } catch (error) {
+      if (attempt === retries - 1) throw error;
+      
+      const delay = Math.min(initialDelay * Math.pow(factor, attempt), maxDelay);
+      console.log(`Retry attempt ${attempt + 1}/${retries} after ${delay}ms`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+};
+
+// Request timeout middleware
+app.use((req, res, next) => {
+  req.setTimeout(30000, () => {
+    res.status(408).json({ message: 'Request timeout' });
+  });
+  next();
+});
+
 // Upload & Extract Face Embeddings - Updated for memory storage
 app.post("/upload", upload.single("image"), async (req, res) => {
   if (!req.file) {
@@ -97,27 +140,37 @@ app.post("/upload", upload.single("image"), async (req, res) => {
   }
 
   try {
-    console.log("Processing image upload, size:", req.file.size);
-    
-    // Check if models are loaded
-    if (!faceapi.nets.ssdMobilenetv1.isLoaded) {
-      console.log("Models not loaded, attempting to load...");
-      await loadModels();
-    }
-    
-    const faceEmbeddings = await detectFacesFromBuffer(req.file.buffer);
-    console.log(`Detected ${faceEmbeddings.length} faces`);
+    const result = await retryAsync(
+      async () => {
+        console.log("Processing image upload, size:", req.file.size);
+        
+        if (!faceapi.nets.ssdMobilenetv1.isLoaded) {
+          console.log("Models not loaded, attempting to load...");
+          await loadModels();
+        }
+        
+        const faceEmbeddings = await detectFacesFromBuffer(req.file.buffer);
+        console.log(`Detected ${faceEmbeddings.length} faces`);
 
-    if (faceEmbeddings.length === 0) {
-      return res.json({ message: "No face detected" });
-    }
+        if (faceEmbeddings.length === 0) {
+          throw new Error('No face detected');
+        }
 
-    res.json({ embedding: Array.from(faceEmbeddings[0]) });
+        return { embedding: Array.from(faceEmbeddings[0]) };
+      },
+      { 
+        retries: 3,
+        timeout: 45000,
+        initialDelay: 2000
+      }
+    );
+
+    res.json(result);
   } catch (error) {
     console.error("Error processing image:", error);
-    res.status(500).json({ 
-      message: "Error processing image", 
-      error: error.message 
+    res.status(error.message === 'No face detected' ? 400 : 500).json({
+      message: error.message === 'No face detected' ? error.message : "Error processing image",
+      error: error.message
     });
   }
 });
@@ -154,55 +207,53 @@ app.post("/save-face", async (req, res) => {
   }
 });
 
-// Helper function to retry async operations
-const retryAsync = async (fn, retries = 3, delay = 1000) => {
-  for (let i = 0; i < retries; i++) {
-    try {
-      return await fn();
-    } catch (error) {
-      if (i === retries - 1) throw error;
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
-  }
-};
-
 // Match Face from Pinecone
 app.post("/match-face", async (req, res) => {
   const { embedding } = req.body;
 
-  if (!embedding) {
-    return res.status(400).json({ message: "Embedding is required" });
-  }
-  
-  if (embedding.length !== 128) {
-    console.log(`Warning: Embedding dimension is ${embedding.length}, expected 128`);
-    return res.status(400).json({ message: "Embedding must be 128 dimensions" });
+  if (!embedding || embedding.length !== 128) {
+    return res.status(400).json({ 
+      message: "Valid 128-dimension embedding is required" 
+    });
   }
 
   try {
-    console.log("Querying Pinecone for face match");
-    const results = await retryAsync(() =>
-      index.query({
-        vector: embedding,
-        topK: 1,
-        includeMetadata: true,
-      })
+    const result = await retryAsync(
+      async () => {
+        console.log("Querying Pinecone for face match");
+        const results = await index.query({
+          vector: embedding,
+          topK: 1,
+          includeMetadata: true,
+        });
+        
+        if (results.matches.length === 0) {
+          throw new Error('No matches found');
+        }
+        
+        return results;
+      },
+      {
+        retries: 5,
+        initialDelay: 1000,
+        maxDelay: 8000,
+        timeout: 20000
+      }
     );
-    console.log(`Found ${results.matches.length} matches`);
 
-    if (results.matches.length > 0 && results.matches[0].score >= 0.85) {
+    if (result.matches[0].score >= 0.85) {
       res.json({
-        match: results.matches[0].metadata.name,
-        score: results.matches[0].score,
+        match: result.matches[0].metadata.name,
+        score: result.matches[0].score,
       });
     } else {
-      res.json({ message: "No match found" });
+      res.json({ message: "No confident match found" });
     }
   } catch (error) {
     console.error("Error querying Pinecone:", error);
-    res.status(500).json({ 
-      message: "Error matching face", 
-      error: error.message 
+    res.status(error.message === 'No matches found' ? 404 : 500).json({
+      message: error.message === 'No matches found' ? error.message : "Error matching face",
+      error: error.message
     });
   }
 });
