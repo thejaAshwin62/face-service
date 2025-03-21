@@ -25,11 +25,11 @@ const hf = new HfInference(process.env.HF_ACCESS_TOKEN);
 const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
 const index = pinecone.index(process.env.PINECONE_INDEX); // Fixed reference
 
-// Image Upload Configuration
+// Image Upload Configuration - Change to memory storage for Vercel compatibility
 const upload = multer({ 
-  dest: "/tmp",
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
-}); // Store image temporarily in /tmp
+});
 
 // Load Face Detection Models
 const modelPath = path.join(process.cwd(), "models");
@@ -52,6 +52,17 @@ const detectFaces = async (imagePath) => {
   return detections.map((d) => d.descriptor.slice(0, 128)); // Reduce to 128D
 };
 
+// Modified function to detect faces from buffer
+const detectFacesFromBuffer = async (buffer) => {
+  const img = await canvas.loadImage(buffer);
+  const detections = await faceapi
+    .detectAllFaces(img)
+    .withFaceLandmarks()
+    .withFaceDescriptors();
+
+  return detections.map((d) => d.descriptor.slice(0, 128)); // Reduce to 128D
+};
+
 // Convert Name to Vector (Ensure 128D)
 const getEmbedding = async (text) => {
   const output = await hf.featureExtraction({
@@ -63,15 +74,16 @@ const getEmbedding = async (text) => {
   return output.slice(0, 128); // Ensure 128D
 };
 
-// Upload & Extract Face Embeddings
+// Upload & Extract Face Embeddings - Updated for memory storage
 app.post("/upload", upload.single("image"), async (req, res) => {
-  const imagePath = req.file.path; // Temporary storage path
+  if (!req.file) {
+    return res.status(400).json({ message: "No image provided" });
+  }
 
   try {
-    const faceEmbeddings = await detectFaces(imagePath);
+    const faceEmbeddings = await detectFacesFromBuffer(req.file.buffer);
 
     if (faceEmbeddings.length === 0) {
-      await fs.remove(imagePath); // Delete file after processing
       return res.json({ message: "No face detected" });
     }
 
@@ -79,8 +91,6 @@ app.post("/upload", upload.single("image"), async (req, res) => {
   } catch (error) {
     console.error("Error processing image:", error);
     res.status(500).json({ message: "Internal server error" });
-  } finally {
-    await fs.remove(imagePath); // Always delete the file after processing
   }
 });
 
