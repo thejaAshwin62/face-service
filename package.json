@@ -3,9 +3,14 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "build": "echo 'No build step required'"
   },
   "dependencies": {
     "@huggingface/inference": "*",
@@ -17,11 +22,9 @@
     "face-api.js": "*",
     "fs-extra": "*",
     "multer": "*",
-    "vercel": "^41.4.1",
     "winston": "^3.17.0"
   },
   "devDependencies": {
     "nodemon": "*"
-  },
-  "type": "commonjs"
+  }
 }
