@@ -2,7 +2,7 @@
   "name": "face-service",
   "version": "1.0.0",
   "description": "",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js"
@@ -17,10 +17,10 @@
     "face-api.js": "*",
     "fs-extra": "*",
     "multer": "*",
+    "vercel": "^41.4.1",
     "winston": "^3.17.0"
   },
   "devDependencies": {
     "nodemon": "*"
   }
 }
-
