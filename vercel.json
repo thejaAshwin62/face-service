@@ -6,10 +6,24 @@
       "use": "@vercel/node"
     }
   ],
+  "buildCommand": "cp -r models/ .vercel/output/static/models/",
   "routes": [
     {
       "src": "/(.*)",
       "dest": "/index.js"
     }
-  ]
+  ],
+  "env": {
+    "HF_ACCESS_TOKEN": "@hf_access_token",
+    "PINECONE_API_KEY": "@pinecone_api_key",
+    "PINECONE_INDEX": "@pinecone_index",
+    "PINECONE_HOST": "@pinecone_host",
+    "PINECONE_REGION": "@pinecone_region"
+  },
+  "functions": {
+    "api/*.js": {
+      "memory": 1024,
+      "maxDuration": 10
+    }
+  }
 }

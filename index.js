@@ -1,13 +1,13 @@
-import "dotenv/config";
-import express from "express";
-import multer from "multer";
-import fs from "fs-extra";
-import faceapi from "face-api.js";
-import canvas from "canvas";
-import { HfInference } from "@huggingface/inference";
-import { Pinecone } from "@pinecone-database/pinecone";
-import path from "path";
-import cors from "cors"; // Import cors
+require("dotenv").config();
+const express = require("express");
+const multer = require("multer");
+const fs = require("fs-extra");
+const faceapi = require("face-api.js");
+const canvas = require("canvas");
+const { HfInference } = require("@huggingface/inference");
+const { Pinecone } = require("@pinecone-database/pinecone");
+const path = require("path");
+const cors = require("cors"); // Import cors
 
 // Setup face-api.js with node-canvas
 const { Image, Canvas, ImageData } = canvas;
@@ -26,11 +26,13 @@ const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
 const index = pinecone.index(process.env.PINECONE_INDEX); // Fixed reference
 
 // Image Upload Configuration
-// const upload = multer({ dest: "uploads/" });
-const upload = multer({ dest: "/tmp" }); // Store image temporarily in /tmp
+const upload = multer({ 
+  dest: "/tmp",
+  limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
+}); // Store image temporarily in /tmp
 
 // Load Face Detection Models
-const modelPath = path.resolve("models");
+const modelPath = path.join(process.cwd(), "models");
 const loadModels = async () => {
   await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
   await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath);
@@ -62,19 +64,6 @@ const getEmbedding = async (text) => {
 };
 
 // Upload & Extract Face Embeddings
-// app.post("/upload", upload.single("image"), async (req, res) => {
-//   const imagePath = req.file.path;
-//   const faceEmbeddings = await detectFaces(imagePath);
-
-//   if (faceEmbeddings.length === 0) {
-//     await fs.remove(imagePath); // Clean up the uploaded file
-//     return res.json({ message: "No face detected" });
-//   }
-
-//   res.json({ embedding: Array.from(faceEmbeddings[0]) });
-//   await fs.remove(imagePath); // Clean up the uploaded file
-// });
-
 app.post("/upload", upload.single("image"), async (req, res) => {
   const imagePath = req.file.path; // Temporary storage path
 
@@ -161,6 +150,15 @@ app.use((err, req, res, next) => {
   res.status(500).json({ message: "Internal server error" });
 });
 
-// Start the Server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+// Make sure port is set properly for Vercel
+const PORT = process.env.PORT || 3000;
+
+// Update how your server listens for requests
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+// Export your Express app for Vercel serverless function
+module.exports = app;
