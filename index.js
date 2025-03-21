@@ -29,19 +29,19 @@ const index = pinecone.index(process.env.PINECONE_INDEX); // Fixed reference
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit
-  }
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  },
 });
 
 // Cleanup middleware
 const cleanup = async (req, res, next) => {
-  res.on('finish', async () => {
+  res.on("finish", async () => {
     if (req.file && req.file.path) {
       try {
         await fs.remove(req.file.path);
-        console.log('Cleaned up:', req.file.path);
+        console.log("Cleaned up:", req.file.path);
       } catch (error) {
-        console.error('Cleanup error:', error);
+        console.error("Cleanup error:", error);
       }
     }
   });
@@ -98,9 +98,9 @@ app.post("/upload", upload.single("image"), async (req, res) => {
     res.json({ embedding: Array.from(faceEmbeddings[0]) });
   } catch (error) {
     console.error("Error processing image:", error);
-    res.status(500).json({ 
-      message: "Error processing image", 
-      error: error.message 
+    res.status(500).json({
+      message: "Error processing image",
+      error: error.message,
     });
   }
 });
@@ -173,12 +173,7 @@ app.use((err, req, res, next) => {
 
 // Start the Server
 const PORT = process.env.PORT || 5000;
-
-if (process.env.NODE_ENV !== 'production') {
-  app.listen(PORT, () => {
-    console.log(`⚡ Development server running on port ${PORT}`);
-  });
-}
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // Export for production (Render)
 export default app;
