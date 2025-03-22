@@ -4,14 +4,12 @@ import multer from "multer";
 import fs from "fs-extra";
 import faceapi from "face-api.js";
 import canvas from "canvas";
-import { HfInference } from "@huggingface/inference";
 import { Pinecone } from "@pinecone-database/pinecone";
 import path from "path";
 import cors from "cors";
 import winston from "winston";
 import sharp from "sharp";
 import NodeCache from "node-cache";
-import { createWriteStream } from 'fs';
 import { join } from 'path';
 import http from 'http';
 
@@ -112,8 +110,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Hugging Face Inference API
-const hf = new HfInference(process.env.HF_ACCESS_TOKEN);
 
 // Pinecone Initialization
 const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
@@ -207,28 +203,6 @@ const detectFaces = async (buffer) => {
   } catch (error) {
     logger.error("Face detection error:", error);
     return [];
-  }
-};
-
-// Optimized embedding function
-const getEmbedding = async (text) => {
-  try {
-    const cacheKey = `text_${text.substring(0, 20)}`;
-    const cached = imageCache.get(cacheKey);
-    if (cached) return cached;
-
-    const output = await hf.featureExtraction({
-      model: "intfloat/multilingual-e5-large-instruct",
-      inputs: text,
-      provider: "hf-inference",
-    });
-
-    const result = output.slice(0, 128);
-    imageCache.set(cacheKey, result);
-    return result;
-  } catch (error) {
-    logger.error("Error getting embedding:", error);
-    throw error;
   }
 };
 
