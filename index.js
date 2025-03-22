@@ -205,16 +205,14 @@ const imageCache = new NodeCache({
 // More aggressive image optimization for Render's constraints
 const optimizeImage = async (buffer) => {
   return sharp(buffer)
-    .resize(320, 320, {  // Further reduced size for speed
+    .resize(240, 240, {  // Further reduced size for faster processing
       fit: "inside",
       withoutEnlargement: true,
     })
     .jpeg({
-      quality: 70,  // Reduced quality for better performance
+      quality: 65,  // Further reduced quality for better performance
       progressive: true,
-      optimizeScans: true,  // Additional optimization
-      trellisQuantisation: true,  // Better compression
-      overshootDeringing: true,  // Better quality at smaller sizes
+      optimizeScans: true,
     })
     .toBuffer();
 };
@@ -254,24 +252,34 @@ const detectFaces = async (buffer) => {
     return await faceDetectionBreaker.exec(async () => {
       const img = await canvas.loadImage(buffer);
       
-      // Even more optimized detection options
+      // Simplified detection options
       const detectionOptions = new faceapi.SsdMobilenetv1Options({
-        minConfidence: 0.2,  // Slight increase to reduce false positives
-        maxResults: 1,  // Only look for the most confident face for speed
+        minConfidence: 0.15,  // Lower threshold to improve success rate
+        maxResults: 1,
       });
 
-      // Fix: Proper detection pipeline with landmarks
-      const detections = await faceapi
-        .detectAllFaces(img, detectionOptions)
-        .withFaceLandmarks()  // Added this back - required for descriptor extraction
-        .withFaceDescriptors();
+      // Improved detection pipeline with better error handling
+      try {
+        const detections = await faceapi
+          .detectAllFaces(img, detectionOptions)
+          .withFaceLandmarks()
+          .withFaceDescriptors();
 
-      if (detections.length === 0) {
-        logger.info("No faces detected in image");
+        if (detections.length === 0) {
+          logger.info("No faces detected in image");
+          return [];
+        }
+
+        return [detections[0].descriptor.slice(0, 128)];
+      } catch (innerError) {
+        logger.error("Detection pipeline error:", innerError);
+        // Attempt fallback with just face detection
+        const simpleFaces = await faceapi.detectAllFaces(img, detectionOptions);
+        if (simpleFaces.length > 0) {
+          logger.info("Face detected but descriptor extraction failed");
+        }
         return [];
       }
-
-      return [detections[0].descriptor.slice(0, 128)];
     });
   } catch (error) {
     logger.error("Face detection error:", error);
@@ -281,6 +289,14 @@ const detectFaces = async (buffer) => {
 
 // Highly optimized upload endpoint with improved timeout handling
 app.post("/upload", upload.single("image"), async (req, res) => {
+  // Set timeout to prevent socket hang up
+  res.setTimeout(60000, () => {
+    logger.warn("Request timeout reached in /upload endpoint");
+    if (!res.headersSent) {
+      res.status(408).json({ message: "Request timeout", status: 'failed' });
+    }
+  });
+
   if (!req.file) {
     return res.status(400).json({ message: "No image provided" });
   }
@@ -294,10 +310,13 @@ app.post("/upload", upload.single("image"), async (req, res) => {
   res.setHeader('X-Request-ID', requestId);
   res.setHeader('Cache-Control', 'no-transform');
 
-  // Fix: Remove early response writing to prevent ERR_HTTP_HEADERS_SENT
-  // res.write('{"processing":true}\n'); // Removed this line
-
   try {
+    // Check file size early to fail fast
+    if (req.file.size > 2 * 1024 * 1024) {
+      requestQueue.delete(requestId);
+      return res.status(413).json({ message: "Image too large", status: 'failed' });
+    }
+
     const cacheKey = Buffer.from(req.file.buffer).toString('base64').substring(0, 20);
     const cachedResult = imageCache.get(cacheKey);
 
@@ -306,37 +325,63 @@ app.post("/upload", upload.single("image"), async (req, res) => {
       return res.json({ embedding: cachedResult, status: 'completed' });
     }
 
-    // More aggressive timeouts for Render
-    const [optimizedBuffer, faceEmbeddings] = await Promise.all([
-      optimizeImage(req.file.buffer),
-      Promise.race([
+    // Process image with shorter timeouts
+    let optimizedBuffer, faceEmbeddings;
+    
+    try {
+      // First optimize image with 5 second timeout
+      optimizedBuffer = await Promise.race([
+        optimizeImage(req.file.buffer),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Image optimization timeout')), 5000))
+      ]);
+      
+      // Then detect faces with 7 second timeout
+      faceEmbeddings = await Promise.race([
         detectFaces(req.file.buffer),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Face detection timeout')), 8000)
-        )
-      ])
-    ]);
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Face detection timeout')), 7000))
+      ]);
+    } catch (processingError) {
+      logger.error("Processing error:", processingError);
+      if (!res.headersSent) {
+        requestQueue.delete(requestId);
+        return res.status(422).json({ 
+          message: "Image processing failed", 
+          error: processingError.message,
+          status: 'failed' 
+        });
+      }
+      return;
+    }
 
-    // Fix: Simplified error handling to prevent double responses
+    // Clean response handling to prevent double responses
     if (!faceEmbeddings || faceEmbeddings.length === 0) {
       requestQueue.delete(requestId);
-      return res.json({ message: "No face detected", status: 'completed' });
+      if (!res.headersSent) {
+        return res.status(400).json({ message: "No face detected", status: 'completed' });
+      }
+      return;
     }
 
     const result = Array.from(faceEmbeddings[0]);
     imageCache.set(cacheKey, result);
     
     requestQueue.delete(requestId);
-    return res.json({ embedding: result, status: 'completed' });
+    if (!res.headersSent) {
+      return res.json({ embedding: result, status: 'completed' });
+    }
 
   } catch (error) {
     requestQueue.delete(requestId);
     logger.error("Error processing image:", error);
-    return res.status(500).json({
-      message: "Error processing image",
-      error: error.message,
-      status: 'failed'
-    });
+    
+    // Only send response if headers haven't been sent yet
+    if (!res.headersSent) {
+      return res.status(500).json({
+        message: "Error processing image",
+        error: error.message,
+        status: 'failed'
+      });
+    }
   }
 });
 
@@ -516,10 +561,10 @@ const startServer = async () => {
       }
     });
     
-    // Configure server timeouts specifically for Render
-    server.keepAliveTimeout = 120000;  // 2 minutes
-    server.headersTimeout = 121000;    // Just above keepAliveTimeout
-    server.timeout = 180000;           // 3 minutes for total request timeout
+    // Configure server timeouts specifically for Render to prevent socket hang ups
+    server.keepAliveTimeout = 65000;  // Increased from 120000
+    server.headersTimeout = 66000;    // Just above keepAliveTimeout
+    server.timeout = 70000;           // Reduced from 180000 to fail faster
     
     // Handle server-level connection errors
     server.on('error', (error) => {
