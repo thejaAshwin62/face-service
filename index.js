@@ -205,14 +205,14 @@ const imageCache = new NodeCache({
 // More aggressive image optimization for Render's constraints
 const optimizeImage = async (buffer) => {
   return sharp(buffer)
-    .resize(240, 240, {  // Further reduced size for faster processing
-      fit: "inside",
+    .resize(160, 160, {  // Further reduced size for free tier
+      fit: "outside",
       withoutEnlargement: true,
     })
     .jpeg({
-      quality: 65,  // Further reduced quality for better performance
-      progressive: true,
-      optimizeScans: true,
+      quality: 60,  // Lower quality for faster processing
+      progressive: false, // Disable progressive for speed
+      optimizeScans: false,  // Disable for speed
     })
     .toBuffer();
 };
@@ -231,53 +231,85 @@ const cleanup = async (req, res, next) => {
 
 app.use(cleanup);
 
-// Load Face Detection Models
+// Load Face Detection Models with progressive loading
 const modelPath = path.resolve("models");
 const loadModels = async () => {
   try {
-    // Load all required models
+    logger.info("Starting model loading...");
+    
+    // Load models in sequence to reduce memory pressure
+    logger.info("Loading SSD MobileNet model...");
     await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
-    await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath); // Added back
+    logger.info("SSD MobileNet loaded");
+    
+    // Small delay to allow garbage collection
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    logger.info("Loading landmark model...");
+    await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath);
+    logger.info("Landmark model loaded");
+    
+    // Small delay to allow garbage collection
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    logger.info("Loading face recognition model...");
     await faceapi.nets.faceRecognitionNet.loadFromDisk(modelPath);
-    logger.info("✅ Models loaded successfully");
+    logger.info("Face recognition model loaded");
+    
+    logger.info("✅ All models loaded successfully");
+    
+    // Trigger garbage collection after loading models
+    if (global.gc) {
+      global.gc();
+      logger.info("GC triggered after model loading");
+    }
   } catch (error) {
     logger.error("Failed to load models:", error);
     process.exit(1);
   }
 };
 
-// Optimized face detection for Render
+// Optimized face detection for Render Free Tier
 const detectFaces = async (buffer) => {
   try {
     return await faceDetectionBreaker.exec(async () => {
       const img = await canvas.loadImage(buffer);
       
-      // Simplified detection options
+      // Even more lightweight detection for Render Free Tier
       const detectionOptions = new faceapi.SsdMobilenetv1Options({
-        minConfidence: 0.15,  // Lower threshold to improve success rate
+        minConfidence: 0.1,  // Further lowered for better success rate
         maxResults: 1,
       });
 
-      // Improved detection pipeline with better error handling
+      // Two-phase detection with fallbacks for better reliability on low resources
       try {
-        const detections = await faceapi
-          .detectAllFaces(img, detectionOptions)
-          .withFaceLandmarks()
-          .withFaceDescriptors();
-
-        if (detections.length === 0) {
+        // First try just face detection to verify a face exists
+        const faceDetections = await faceapi.detectAllFaces(img, detectionOptions);
+        
+        if (faceDetections.length === 0) {
           logger.info("No faces detected in image");
           return [];
         }
-
-        return [detections[0].descriptor.slice(0, 128)];
+        
+        // Then get landmarks and descriptors with robust error handling
+        try {
+          const fullDetections = await faceapi
+            .detectAllFaces(img, detectionOptions)
+            .withFaceLandmarks()
+            .withFaceDescriptors();
+            
+          if (fullDetections.length > 0) {
+            return [fullDetections[0].descriptor.slice(0, 128)];
+          }
+        } catch (descriptorError) {
+          logger.error("Descriptor extraction failed:", descriptorError);
+        }
+        
+        // Still return empty if we couldn't get descriptors
+        logger.info("Face detected but couldn't extract features");
+        return [];
       } catch (innerError) {
         logger.error("Detection pipeline error:", innerError);
-        // Attempt fallback with just face detection
-        const simpleFaces = await faceapi.detectAllFaces(img, detectionOptions);
-        if (simpleFaces.length > 0) {
-          logger.info("Face detected but descriptor extraction failed");
-        }
         return [];
       }
     });
@@ -497,21 +529,34 @@ app.get("/ping", (req, res) => {
   res.status(200).send("pong");
 });
 
-// Warmup function for Render
+// Warmup function with staged loading for memory efficiency
 const warmup = async () => {
   try {
     logger.info("Warming up service...");
     
-    // Preload models in memory
+    // Preload models in memory with progressive loading
     await loadModels();
     
-    // Pre-initialize Sharp
+    // Pre-initialize Sharp with minimal operation
     await sharp(Buffer.from([0])).resize(1, 1).toBuffer();
     
-    // Ping Pinecone to establish connection
-    await index.describeIndexStats();
+    // Only ping Pinecone if API key is valid
+    if (process.env.PINECONE_API_KEY && process.env.PINECONE_API_KEY.length > 10) {
+      try {
+        await index.describeIndexStats();
+        logger.info("Pinecone connection verified");
+      } catch (pineconeError) {
+        logger.error("Pinecone connection failed:", pineconeError);
+      }
+    }
     
     logger.info("Warmup complete");
+    
+    // Final garbage collection after warmup
+    if (global.gc) {
+      global.gc();
+      logger.info("GC triggered after warmup");
+    }
   } catch (error) {
     logger.error("Warmup failed:", error);
   }
@@ -535,7 +580,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ message: "Internal server error" });
 });
 
-// Initialize server with Render-specific optimizations
+// Initialize server with specific tweaks for Render free tier + large models
 const startServer = async () => {
   try {
     // Run memory optimization before startup
@@ -549,31 +594,35 @@ const startServer = async () => {
     
     const PORT = process.env.PORT || 5000;
     
-    // Configure periodic maintenance tasks
-    setInterval(cleanOldLogs, 24 * 60 * 60 * 1000);
-    setInterval(memoryManagement, 30 * 60 * 1000);
+    // Configure periodic maintenance tasks - more frequent for free tier
+    setInterval(cleanOldLogs, 12 * 60 * 60 * 1000); // Every 12 hours
+    setInterval(memoryManagement, 15 * 60 * 1000);  // Every 15 minutes
     
     const server = app.listen(PORT, () => {
       logger.info(`✅ Server running on port ${PORT}`);
       // Start keep-alive mechanism for Render free tier
-      if (process.env.ENVIRONMENT === 'render') {
+      if (process.env.ENVIRONMENT === 'render' || !process.env.ENVIRONMENT) {
         keepAlive();
       }
     });
     
     // Configure server timeouts specifically for Render to prevent socket hang ups
-    server.keepAliveTimeout = 65000;  // Increased from 120000
-    server.headersTimeout = 66000;    // Just above keepAliveTimeout
-    server.timeout = 70000;           // Reduced from 180000 to fail faster
+    server.keepAliveTimeout = 45000;  // Reduced further for free tier
+    server.headersTimeout = 46000;    // Just above keepAliveTimeout
+    server.timeout = 50000;           // Reduced further to fail faster with large models
     
     // Handle server-level connection errors
     server.on('error', (error) => {
       logger.error("Server error:", error);
     });
     
-    // Handle graceful shutdown
+    // Handle graceful shutdown with model cleanup
     process.on('SIGTERM', () => {
       logger.info('SIGTERM received, shutting down gracefully');
+      
+      // Clear any cache
+      imageCache.flushAll();
+      
       server.close(() => {
         logger.info('Server closed');
         process.exit(0);
