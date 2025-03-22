@@ -13,79 +13,13 @@ import NodeCache from "node-cache";
 import { join } from 'path';
 import http from 'http';
 
-// Memory management for Render
-const memoryManagement = () => {
-  if (global.gc) {
-    global.gc();
-    logger.info("Manual garbage collection triggered");
-  }
-};
-
-// Schedule memory cleanup every 5 minutes
-setInterval(memoryManagement, 5 * 60 * 1000);
-
-// Improved agent configuration specifically for Render
+// Add request queue and agent configuration
 const agent = new http.Agent({
   keepAlive: true,
-  maxSockets: 25,  // Further reduced to prevent Render connection limits
-  maxFreeSockets: 5,
-  timeout: 120000,  // 2 minutes for Render's longer cold starts
+  maxSockets: 100,
+  maxFreeSockets: 10,
+  timeout: 30000,
 });
-
-// Circuit breaker for external services
-class CircuitBreaker {
-  constructor(name, timeout = 10000) {
-    this.name = name;
-    this.state = 'CLOSED';
-    this.failureCount = 0;
-    this.failureThreshold = 5;
-    this.resetTimeout = 30000;
-    this.timeout = timeout;
-  }
-
-  async exec(fn) {
-    if (this.state === 'OPEN') {
-      logger.warn(`Circuit breaker for ${this.name} is OPEN`);
-      throw new Error(`Service ${this.name} is unavailable`);
-    }
-
-    try {
-      const result = await Promise.race([
-        fn(),
-        new Promise((_, reject) => setTimeout(() => 
-          reject(new Error(`${this.name} timeout`)), this.timeout))
-      ]);
-
-      this.onSuccess();
-      return result;
-    } catch (error) {
-      this.onFailure();
-      throw error;
-    }
-  }
-
-  onSuccess() {
-    this.failureCount = 0;
-    this.state = 'CLOSED';
-  }
-
-  onFailure() {
-    this.failureCount++;
-    if (this.failureCount >= this.failureThreshold) {
-      this.state = 'OPEN';
-      logger.warn(`Circuit breaker for ${this.name} opened`);
-      setTimeout(() => {
-        this.state = 'HALF-OPEN';
-        this.failureCount = 0;
-        logger.info(`Circuit breaker for ${this.name} half-open`);
-      }, this.resetTimeout);
-    }
-  }
-}
-
-// Create circuit breakers for key operations
-const pineconeBreaker = new CircuitBreaker('pinecone', 15000);
-const faceDetectionBreaker = new CircuitBreaker('faceDetection', 8000);
 
 // Initialize request queue and constants
 const requestQueue = new Map();
@@ -109,15 +43,10 @@ setInterval(cleanupQueue, 60000);
 const { Image, Canvas, ImageData } = canvas;
 faceapi.env.monkeyPatch({ Image, Canvas, ImageData });
 
-// Express App with improved settings
+// Express App
 const app = express();
 app.use(express.json({ limit: "2mb" })); // Reduced JSON size limit
-app.use(cors({
-  origin: "*",
-  methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
-  preflightContinue: false,
-  optionsSuccessStatus: 204
-}));
+app.use(cors({ origin: "*" }));
 
 // Add log cleanup function
 const cleanOldLogs = async () => {
@@ -202,17 +131,17 @@ const imageCache = new NodeCache({
   maxKeys: 100, // Limit cache size
 });
 
-// More aggressive image optimization for Render's constraints
+// More aggressive image optimization
 const optimizeImage = async (buffer) => {
   return sharp(buffer)
-    .resize(160, 160, {  // Further reduced size for free tier
-      fit: "outside",
+    .resize(400, 400, {
+      // Increased from 320x320 to preserve more details
+      fit: "inside",
       withoutEnlargement: true,
     })
     .jpeg({
-      quality: 60,  // Lower quality for faster processing
-      progressive: false, // Disable progressive for speed
-      optimizeScans: false,  // Disable for speed
+      quality: 80, // Increased quality to preserve details
+      progressive: true,
     })
     .toBuffer();
 };
@@ -231,104 +160,54 @@ const cleanup = async (req, res, next) => {
 
 app.use(cleanup);
 
-// Load Face Detection Models with progressive loading
+// Load Face Detection Models
 const modelPath = path.resolve("models");
 const loadModels = async () => {
   try {
-    logger.info("Starting model loading...");
-    
-    // Load models in sequence to reduce memory pressure
-    logger.info("Loading SSD MobileNet model...");
+    // Load all required models
     await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
-    logger.info("SSD MobileNet loaded");
-    
-    // Small delay to allow garbage collection
-    await new Promise(resolve => setTimeout(resolve, 500));
-    
-    logger.info("Loading landmark model...");
-    await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath);
-    logger.info("Landmark model loaded");
-    
-    // Small delay to allow garbage collection
-    await new Promise(resolve => setTimeout(resolve, 500));
-    
-    logger.info("Loading face recognition model...");
+    await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath); // Added back
     await faceapi.nets.faceRecognitionNet.loadFromDisk(modelPath);
-    logger.info("Face recognition model loaded");
-    
-    logger.info("✅ All models loaded successfully");
-    
-    // Trigger garbage collection after loading models
-    if (global.gc) {
-      global.gc();
-      logger.info("GC triggered after model loading");
-    }
+    logger.info("✅ Models loaded successfully");
   } catch (error) {
     logger.error("Failed to load models:", error);
     process.exit(1);
   }
 };
 
-// Optimized face detection for Render Free Tier
+// Optimized face detection
 const detectFaces = async (buffer) => {
   try {
-    return await faceDetectionBreaker.exec(async () => {
-      const img = await canvas.loadImage(buffer);
-      
-      // Even more lightweight detection for Render Free Tier
-      const detectionOptions = new faceapi.SsdMobilenetv1Options({
-        minConfidence: 0.1,  // Further lowered for better success rate
-        maxResults: 1,
-      });
+    const img = await canvas.loadImage(buffer);
 
-      // Two-phase detection with fallbacks for better reliability on low resources
-      try {
-        // First try just face detection to verify a face exists
-        const faceDetections = await faceapi.detectAllFaces(img, detectionOptions);
-        
-        if (faceDetections.length === 0) {
-          logger.info("No faces detected in image");
-          return [];
-        }
-        
-        // Then get landmarks and descriptors with robust error handling
-        try {
-          const fullDetections = await faceapi
-            .detectAllFaces(img, detectionOptions)
-            .withFaceLandmarks()
-            .withFaceDescriptors();
-            
-          if (fullDetections.length > 0) {
-            return [fullDetections[0].descriptor.slice(0, 128)];
-          }
-        } catch (descriptorError) {
-          logger.error("Descriptor extraction failed:", descriptorError);
-        }
-        
-        // Still return empty if we couldn't get descriptors
-        logger.info("Face detected but couldn't extract features");
-        return [];
-      } catch (innerError) {
-        logger.error("Detection pipeline error:", innerError);
-        return [];
-      }
+    // More sensitive detection options
+    const detectionOptions = new faceapi.SsdMobilenetv1Options({
+      minConfidence: 0.1, // Much lower threshold to detect more faces
+      maxResults: 3, // Look for multiple faces and take the best one
     });
+
+    // Use all faces detection to find any possible faces
+    const detections = await faceapi
+      .detectAllFaces(img, detectionOptions)
+      .withFaceLandmarks() // Re-enable landmarks to help with difficult faces
+      .withFaceDescriptors();
+
+    if (detections.length === 0) {
+      logger.info("No faces detected in image");
+      return [];
+    }
+
+    // Sort by detection confidence and take the highest
+    detections.sort((a, b) => b.detection.score - a.detection.score);
+    return [detections[0].descriptor.slice(0, 128)];
   } catch (error) {
     logger.error("Face detection error:", error);
     return [];
   }
 };
 
-// Highly optimized upload endpoint with improved timeout handling
+// Highly optimized upload endpoint
 app.post("/upload", upload.single("image"), async (req, res) => {
-  // Set timeout to prevent socket hang up
-  res.setTimeout(60000, () => {
-    logger.warn("Request timeout reached in /upload endpoint");
-    if (!res.headersSent) {
-      res.status(408).json({ message: "Request timeout", status: 'failed' });
-    }
-  });
-
   if (!req.file) {
     return res.status(400).json({ message: "No image provided" });
   }
@@ -336,19 +215,11 @@ app.post("/upload", upload.single("image"), async (req, res) => {
   const requestId = Date.now().toString();
   requestQueue.set(requestId, { status: 'processing' });
 
-  // Enhanced headers for Render's proxy settings
+  // Set response headers for faster client processing
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Keep-Alive', 'timeout=120');
   res.setHeader('X-Request-ID', requestId);
-  res.setHeader('Cache-Control', 'no-transform');
 
   try {
-    // Check file size early to fail fast
-    if (req.file.size > 2 * 1024 * 1024) {
-      requestQueue.delete(requestId);
-      return res.status(413).json({ message: "Image too large", status: 'failed' });
-    }
-
     const cacheKey = Buffer.from(req.file.buffer).toString('base64').substring(0, 20);
     const cachedResult = imageCache.get(cacheKey);
 
@@ -357,63 +228,38 @@ app.post("/upload", upload.single("image"), async (req, res) => {
       return res.json({ embedding: cachedResult, status: 'completed' });
     }
 
-    // Process image with shorter timeouts
-    let optimizedBuffer, faceEmbeddings;
-    
-    try {
-      // First optimize image with 5 second timeout
-      optimizedBuffer = await Promise.race([
-        optimizeImage(req.file.buffer),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Image optimization timeout')), 5000))
-      ]);
-      
-      // Then detect faces with 7 second timeout
-      faceEmbeddings = await Promise.race([
+    // Parallel processing
+    const [optimizedBuffer, faceDetectionPromise] = await Promise.all([
+      optimizeImage(req.file.buffer),
+      Promise.race([
         detectFaces(req.file.buffer),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Face detection timeout')), 7000))
-      ]);
-    } catch (processingError) {
-      logger.error("Processing error:", processingError);
-      if (!res.headersSent) {
-        requestQueue.delete(requestId);
-        return res.status(422).json({ 
-          message: "Image processing failed", 
-          error: processingError.message,
-          status: 'failed' 
-        });
-      }
-      return;
-    }
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Face detection timeout')), 5000)
+        )
+      ])
+    ]);
 
-    // Clean response handling to prevent double responses
+    const faceEmbeddings = await faceDetectionPromise;
+
     if (!faceEmbeddings || faceEmbeddings.length === 0) {
       requestQueue.delete(requestId);
-      if (!res.headersSent) {
-        return res.status(400).json({ message: "No face detected", status: 'completed' });
-      }
-      return;
+      return res.json({ message: "No face detected", status: 'completed' });
     }
 
     const result = Array.from(faceEmbeddings[0]);
     imageCache.set(cacheKey, result);
     
     requestQueue.delete(requestId);
-    if (!res.headersSent) {
-      return res.json({ embedding: result, status: 'completed' });
-    }
+    return res.json({ embedding: result, status: 'completed' });
 
   } catch (error) {
     requestQueue.delete(requestId);
     logger.error("Error processing image:", error);
-    
-    // Only send response if headers haven't been sent yet
-    if (!res.headersSent) {
-      return res.status(500).json({
-        message: "Error processing image",
-        error: error.message,
-        status: 'failed'
-      });
-    }
+    return res.status(500).json({
+      message: "Error processing image",
+      error: error.message,
+      status: 'failed'
+    });
   }
 });
 
@@ -467,19 +313,33 @@ app.post("/match-face", async (req, res) => {
   requestQueue.set(requestId, { status: 'processing' });
 
   try {
-    const matchResult = await pineconeBreaker.exec(async () => {
-      const queryResponse = await index.query({
-        vector: embedding,
-        topK: 1,
-        includeMetadata: true,
-      });
-      
-      if (!queryResponse || !queryResponse.matches) {
-        throw new Error('Invalid query response');
-      }
-      
-      return queryResponse;
-    });
+    // Set longer timeout for face matching
+    const matchPromise = retryAsync(
+      async () => {
+        const queryResponse = await index.query({
+          vector: embedding,
+          topK: 1,
+          includeMetadata: true,
+        });
+        
+        // Validate query response
+        if (!queryResponse || !queryResponse.matches) {
+          throw new Error('Invalid query response');
+        }
+        
+        return queryResponse;
+      },
+      3, // number of retries
+      1000 // delay between retries
+    );
+
+    // Wait for response with timeout
+    const matchResult = await Promise.race([
+      matchPromise,
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Match operation timeout')), 10000)
+      )
+    ]);
 
     // Process match results
     if (matchResult.matches.length > 0 && matchResult.matches[0].score >= 0.85) {
@@ -524,110 +384,29 @@ app.get("/status/:requestId", (req, res) => {
   res.json({ status: request.status });
 });
 
-// Add a keepalive endpoint for preventing cold starts
-app.get("/ping", (req, res) => {
-  res.status(200).send("pong");
-});
-
-// Warmup function with staged loading for memory efficiency
-const warmup = async () => {
-  try {
-    logger.info("Warming up service...");
-    
-    // Preload models in memory with progressive loading
-    await loadModels();
-    
-    // Pre-initialize Sharp with minimal operation
-    await sharp(Buffer.from([0])).resize(1, 1).toBuffer();
-    
-    // Only ping Pinecone if API key is valid
-    if (process.env.PINECONE_API_KEY && process.env.PINECONE_API_KEY.length > 10) {
-      try {
-        await index.describeIndexStats();
-        logger.info("Pinecone connection verified");
-      } catch (pineconeError) {
-        logger.error("Pinecone connection failed:", pineconeError);
-      }
-    }
-    
-    logger.info("Warmup complete");
-    
-    // Final garbage collection after warmup
-    if (global.gc) {
-      global.gc();
-      logger.info("GC triggered after warmup");
-    }
-  } catch (error) {
-    logger.error("Warmup failed:", error);
-  }
-};
-
-// Add a self-ping to prevent Render's free tier from sleeping
-const keepAlive = () => {
-  const interval = 14 * 60 * 1000; // 14 minutes (just under Render's 15-min sleep time)
-  setInterval(() => {
-    http.get(`http://localhost:${process.env.PORT || 5000}/ping`, res => {
-      logger.debug("Keep-alive ping sent");
-    }).on('error', err => {
-      logger.error("Keep-alive error:", err);
-    });
-  }, interval);
-};
-
 // Error handling middleware (improved)
 app.use((err, req, res, next) => {
   logger.error("Unhandled error:", err);
   res.status(500).json({ message: "Internal server error" });
 });
 
-// Initialize server with specific tweaks for Render free tier + large models
+// Initialize server
 const startServer = async () => {
   try {
-    // Run memory optimization before startup
-    memoryManagement();
-    
     // Clean old logs before starting
     await cleanOldLogs();
     
-    // Warm up the service
-    await warmup();
-    
+    await loadModels();
     const PORT = process.env.PORT || 5000;
     
-    // Configure periodic maintenance tasks - more frequent for free tier
-    setInterval(cleanOldLogs, 12 * 60 * 60 * 1000); // Every 12 hours
-    setInterval(memoryManagement, 15 * 60 * 1000);  // Every 15 minutes
+    // Schedule periodic log cleanup (every 24 hours)
+    setInterval(cleanOldLogs, 24 * 60 * 60 * 1000);
     
-    const server = app.listen(PORT, () => {
-      logger.info(`✅ Server running on port ${PORT}`);
-      // Start keep-alive mechanism for Render free tier
-      if (process.env.ENVIRONMENT === 'render' || !process.env.ENVIRONMENT) {
-        keepAlive();
-      }
-    });
+    const server = app.listen(PORT, () => logger.info(`✅ Server running on port ${PORT}`));
     
-    // Configure server timeouts specifically for Render to prevent socket hang ups
-    server.keepAliveTimeout = 45000;  // Reduced further for free tier
-    server.headersTimeout = 46000;    // Just above keepAliveTimeout
-    server.timeout = 50000;           // Reduced further to fail faster with large models
-    
-    // Handle server-level connection errors
-    server.on('error', (error) => {
-      logger.error("Server error:", error);
-    });
-    
-    // Handle graceful shutdown with model cleanup
-    process.on('SIGTERM', () => {
-      logger.info('SIGTERM received, shutting down gracefully');
-      
-      // Clear any cache
-      imageCache.flushAll();
-      
-      server.close(() => {
-        logger.info('Server closed');
-        process.exit(0);
-      });
-    });
+    // Configure server timeouts
+    server.keepAliveTimeout = 30000;
+    server.headersTimeout = 35000;
     
   } catch (error) {
     logger.error("Failed to start server:", error);
