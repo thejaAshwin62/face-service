@@ -11,6 +11,9 @@ import cors from "cors";
 import winston from "winston";
 import sharp from "sharp";
 import NodeCache from "node-cache";
+import { createWriteStream } from 'fs';
+import { join } from 'path';
+import http from 'http';
 
 // Setup face-api.js with node-canvas
 const { Image, Canvas, ImageData } = canvas;
@@ -21,7 +24,28 @@ const app = express();
 app.use(express.json({ limit: "2mb" })); // Reduced JSON size limit
 app.use(cors({ origin: "*" }));
 
-// Configure Winston Logger with reduced verbosity
+// Add log cleanup function
+const cleanOldLogs = async () => {
+  try {
+    const logsDir = join(process.cwd(), 'logs');
+    const files = await fs.readdir(logsDir);
+    const currentLog = 'app.log';
+    
+    for (const file of files) {
+      if (file !== currentLog) {
+        await fs.remove(join(logsDir, file));
+        logger.info(`Cleaned up old log file: ${file}`);
+      }
+    }
+  } catch (error) {
+    console.error('Log cleanup failed:', error);
+  }
+};
+
+// Configure Winston Logger with rotation
+const logDir = 'logs';
+fs.ensureDirSync(logDir);
+
 const logger = winston.createLogger({
   level: "info",
   format: winston.format.combine(
@@ -31,11 +55,13 @@ const logger = winston.createLogger({
   transports: [
     new winston.transports.Console(),
     new winston.transports.File({
-      filename: "logs/app.log",
+      filename: join(logDir, 'app.log'),
       maxsize: 5242880, // 5MB
-      maxFiles: 5,
-    }),
-  ],
+      maxFiles: 1, // Keep only one file
+      tailable: true,
+      options: { flags: 'w' } // Overwrite file on restart
+    })
+  ]
 });
 
 // Streamlined logging middleware
@@ -186,54 +212,57 @@ app.post("/upload", upload.single("image"), async (req, res) => {
     return res.status(400).json({ message: "No image provided" });
   }
 
+  const requestId = Date.now().toString();
+  requestQueue.set(requestId, { status: 'processing' });
+
+  // Set response headers for faster client processing
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Request-ID', requestId);
+
   try {
-    // Generate efficient cache key
-    const cacheKey = Buffer.from(req.file.buffer)
-      .toString("base64")
-      .substring(0, 20);
+    // Start processing indication
+    res.writeProcessing = true;
+    res.write(JSON.stringify({ status: 'processing' }) + '\n');
 
-    // Check cache first
+    const cacheKey = Buffer.from(req.file.buffer).toString('base64').substring(0, 20);
     const cachedResult = imageCache.get(cacheKey);
+
     if (cachedResult) {
-      return res.json({ embedding: cachedResult });
+      requestQueue.delete(requestId);
+      return res.json({ embedding: cachedResult, status: 'completed' });
     }
 
-    // Set shorter timeout
-    const timeout = setTimeout(() => {
-      return res.status(408).json({ message: "Request timeout" });
-    }, 10000); // 10 second timeout (reduced from 30s)
+    // Parallel processing
+    const [optimizedBuffer, faceDetectionPromise] = await Promise.all([
+      optimizeImage(req.file.buffer),
+      Promise.race([
+        detectFaces(req.file.buffer),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Face detection timeout')), 5000)
+        )
+      ])
+    ]);
 
-    // Validate file size
-    if (req.file.size > 2 * 1024 * 1024) {
-      clearTimeout(timeout);
-      return res
-        .status(400)
-        .json({ message: "Image too large, max 2MB allowed" });
-    }
-
-    // Optimize image more aggressively
-    const optimizedBuffer = await optimizeImage(req.file.buffer);
-
-    // Process face detection with optimized function
-    const faceEmbeddings = await detectFaces(optimizedBuffer);
-
-    clearTimeout(timeout);
+    const faceEmbeddings = await faceDetectionPromise;
 
     if (!faceEmbeddings || faceEmbeddings.length === 0) {
-      return res.json({ message: "No face detected" });
+      requestQueue.delete(requestId);
+      return res.json({ message: "No face detected", status: 'completed' });
     }
 
     const result = Array.from(faceEmbeddings[0]);
-
-    // Cache the result
     imageCache.set(cacheKey, result);
+    
+    requestQueue.delete(requestId);
+    res.json({ embedding: result, status: 'completed' });
 
-    res.json({ embedding: result });
   } catch (error) {
+    requestQueue.delete(requestId);
     logger.error("Error processing image:", error);
     res.status(500).json({
       message: "Error processing image",
       error: error.message,
+      status: 'failed'
     });
   }
 });
@@ -280,27 +309,50 @@ app.post("/match-face", async (req, res) => {
     return res.status(400).json({ message: "Embedding dimension must be 128" });
   }
 
+  const requestId = Date.now().toString();
   try {
-    const results = await retryAsync(() =>
+    // Parallel query execution with timeout
+    const matchResult = await Promise.race([
       index.query({
         vector: embedding,
         topK: 1,
         includeMetadata: true,
-      })
-    );
+      }),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Query timeout')), 3000)
+      )
+    ]);
 
-    if (results.matches.length > 0 && results.matches[0].score >= 0.85) {
-      res.json({
-        match: results.matches[0].metadata.name,
-        score: results.matches[0].score,
+    if (matchResult.matches.length > 0 && matchResult.matches[0].score >= 0.85) {
+      return res.json({
+        match: matchResult.matches[0].metadata.name,
+        score: matchResult.matches[0].score,
+        requestId
       });
-    } else {
-      res.json({ message: "No match found" });
     }
+
+    res.json({ message: "No match found", requestId });
+
   } catch (error) {
-    logger.error("Error querying Pinecone:", error);
-    res.status(500).json({ message: "Internal server error" });
+    logger.error("Error matching face:", error);
+    res.status(500).json({ 
+      message: "Error matching face", 
+      requestId,
+      error: error.message 
+    });
   }
+});
+
+// Add status check endpoint
+app.get("/status/:requestId", (req, res) => {
+  const { requestId } = req.params;
+  const request = requestQueue.get(requestId);
+  
+  if (!request) {
+    return res.json({ status: 'not_found' });
+  }
+  
+  res.json({ status: request.status });
 });
 
 // Error handling middleware (improved)
@@ -312,9 +364,21 @@ app.use((err, req, res, next) => {
 // Initialize server
 const startServer = async () => {
   try {
+    // Clean old logs before starting
+    await cleanOldLogs();
+    
     await loadModels();
     const PORT = process.env.PORT || 5000;
-    app.listen(PORT, () => logger.info(`✅ Server running on port ${PORT}`));
+    
+    // Schedule periodic log cleanup (every 24 hours)
+    setInterval(cleanOldLogs, 24 * 60 * 60 * 1000);
+    
+    const server = app.listen(PORT, () => logger.info(`✅ Server running on port ${PORT}`));
+    
+    // Configure server timeouts
+    server.keepAliveTimeout = 30000;
+    server.headersTimeout = 35000;
+    
   } catch (error) {
     logger.error("Failed to start server:", error);
     process.exit(1);
