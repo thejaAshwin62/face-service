@@ -15,6 +15,32 @@ import { createWriteStream } from 'fs';
 import { join } from 'path';
 import http from 'http';
 
+// Add request queue and agent configuration
+const agent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 100,
+  maxFreeSockets: 10,
+  timeout: 30000,
+});
+
+// Initialize request queue and constants
+const requestQueue = new Map();
+const MAX_CONCURRENT_REQUESTS = 10;
+const REQUEST_TIMEOUT = 30000; // 30 seconds
+
+// Request queue cleanup utility
+const cleanupQueue = () => {
+  const now = Date.now();
+  for (const [id, request] of requestQueue.entries()) {
+    if (now - parseInt(id) > REQUEST_TIMEOUT) {
+      requestQueue.delete(id);
+    }
+  }
+};
+
+// Schedule queue cleanup every minute
+setInterval(cleanupQueue, 60000);
+
 // Setup face-api.js with node-canvas
 const { Image, Canvas, ImageData } = canvas;
 faceapi.env.monkeyPatch({ Image, Canvas, ImageData });
@@ -220,10 +246,6 @@ app.post("/upload", upload.single("image"), async (req, res) => {
   res.setHeader('X-Request-ID', requestId);
 
   try {
-    // Start processing indication
-    res.writeProcessing = true;
-    res.write(JSON.stringify({ status: 'processing' }) + '\n');
-
     const cacheKey = Buffer.from(req.file.buffer).toString('base64').substring(0, 20);
     const cachedResult = imageCache.get(cacheKey);
 
@@ -254,12 +276,12 @@ app.post("/upload", upload.single("image"), async (req, res) => {
     imageCache.set(cacheKey, result);
     
     requestQueue.delete(requestId);
-    res.json({ embedding: result, status: 'completed' });
+    return res.json({ embedding: result, status: 'completed' });
 
   } catch (error) {
     requestQueue.delete(requestId);
     logger.error("Error processing image:", error);
-    res.status(500).json({
+    return res.status(500).json({
       message: "Error processing image",
       error: error.message,
       status: 'failed'
@@ -301,44 +323,77 @@ const retryAsync = async (fn, retries = 2, delay = 500) => {
   }
 };
 
-// Match Face from Pinecone (optimized)
+// Enhanced match-face endpoint with reliable response handling
 app.post("/match-face", async (req, res) => {
   const { embedding } = req.body;
+  const requestId = Date.now().toString();
 
   if (!embedding || embedding.length !== 128) {
-    return res.status(400).json({ message: "Embedding dimension must be 128" });
+    return res.status(400).json({ 
+      message: "Invalid embedding dimension", 
+      requestId,
+      status: 'failed' 
+    });
   }
 
-  const requestId = Date.now().toString();
+  requestQueue.set(requestId, { status: 'processing' });
+
   try {
-    // Parallel query execution with timeout
+    // Set longer timeout for face matching
+    const matchPromise = retryAsync(
+      async () => {
+        const queryResponse = await index.query({
+          vector: embedding,
+          topK: 1,
+          includeMetadata: true,
+        });
+        
+        // Validate query response
+        if (!queryResponse || !queryResponse.matches) {
+          throw new Error('Invalid query response');
+        }
+        
+        return queryResponse;
+      },
+      3, // number of retries
+      1000 // delay between retries
+    );
+
+    // Wait for response with timeout
     const matchResult = await Promise.race([
-      index.query({
-        vector: embedding,
-        topK: 1,
-        includeMetadata: true,
-      }),
+      matchPromise,
       new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Query timeout')), 3000)
+        setTimeout(() => reject(new Error('Match operation timeout')), 10000)
       )
     ]);
 
+    // Process match results
     if (matchResult.matches.length > 0 && matchResult.matches[0].score >= 0.85) {
+      requestQueue.delete(requestId);
       return res.json({
         match: matchResult.matches[0].metadata.name,
         score: matchResult.matches[0].score,
-        requestId
+        requestId,
+        status: 'completed'
       });
     }
 
-    res.json({ message: "No match found", requestId });
+    requestQueue.delete(requestId);
+    return res.json({ 
+      message: "No match found", 
+      requestId,
+      status: 'completed'
+    });
 
   } catch (error) {
-    logger.error("Error matching face:", error);
-    res.status(500).json({ 
-      message: "Error matching face", 
+    requestQueue.delete(requestId);
+    logger.error("Face matching error:", error);
+    
+    return res.status(500).json({ 
+      message: "Face matching failed", 
+      error: error.message,
       requestId,
-      error: error.message 
+      status: 'failed'
     });
   }
 });
