@@ -4,40 +4,13 @@ import multer from "multer";
 import fs from "fs-extra";
 import faceapi from "face-api.js";
 import canvas from "canvas";
+import { HfInference } from "@huggingface/inference";
 import { Pinecone } from "@pinecone-database/pinecone";
 import path from "path";
 import cors from "cors";
 import winston from "winston";
 import sharp from "sharp";
 import NodeCache from "node-cache";
-import { join } from 'path';
-import http from 'http';
-
-// Add request queue and agent configuration
-const agent = new http.Agent({
-  keepAlive: true,
-  maxSockets: 100,
-  maxFreeSockets: 10,
-  timeout: 30000,
-});
-
-// Initialize request queue and constants
-const requestQueue = new Map();
-const MAX_CONCURRENT_REQUESTS = 10;
-const REQUEST_TIMEOUT = 30000; // 30 seconds
-
-// Request queue cleanup utility
-const cleanupQueue = () => {
-  const now = Date.now();
-  for (const [id, request] of requestQueue.entries()) {
-    if (now - parseInt(id) > REQUEST_TIMEOUT) {
-      requestQueue.delete(id);
-    }
-  }
-};
-
-// Schedule queue cleanup every minute
-setInterval(cleanupQueue, 60000);
 
 // Setup face-api.js with node-canvas
 const { Image, Canvas, ImageData } = canvas;
@@ -48,28 +21,7 @@ const app = express();
 app.use(express.json({ limit: "2mb" })); // Reduced JSON size limit
 app.use(cors({ origin: "*" }));
 
-// Add log cleanup function
-const cleanOldLogs = async () => {
-  try {
-    const logsDir = join(process.cwd(), 'logs');
-    const files = await fs.readdir(logsDir);
-    const currentLog = 'app.log';
-    
-    for (const file of files) {
-      if (file !== currentLog) {
-        await fs.remove(join(logsDir, file));
-        logger.info(`Cleaned up old log file: ${file}`);
-      }
-    }
-  } catch (error) {
-    console.error('Log cleanup failed:', error);
-  }
-};
-
-// Configure Winston Logger with rotation
-const logDir = 'logs';
-fs.ensureDirSync(logDir);
-
+// Configure Winston Logger with reduced verbosity
 const logger = winston.createLogger({
   level: "info",
   format: winston.format.combine(
@@ -79,13 +31,11 @@ const logger = winston.createLogger({
   transports: [
     new winston.transports.Console(),
     new winston.transports.File({
-      filename: join(logDir, 'app.log'),
+      filename: "logs/app.log",
       maxsize: 5242880, // 5MB
-      maxFiles: 1, // Keep only one file
-      tailable: true,
-      options: { flags: 'w' } // Overwrite file on restart
-    })
-  ]
+      maxFiles: 5,
+    }),
+  ],
 });
 
 // Streamlined logging middleware
@@ -110,6 +60,8 @@ app.use((req, res, next) => {
   next();
 });
 
+// Hugging Face Inference API
+const hf = new HfInference(process.env.HF_ACCESS_TOKEN);
 
 // Pinecone Initialization
 const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
@@ -206,59 +158,82 @@ const detectFaces = async (buffer) => {
   }
 };
 
+// Optimized embedding function
+const getEmbedding = async (text) => {
+  try {
+    const cacheKey = `text_${text.substring(0, 20)}`;
+    const cached = imageCache.get(cacheKey);
+    if (cached) return cached;
+
+    const output = await hf.featureExtraction({
+      model: "intfloat/multilingual-e5-large-instruct",
+      inputs: text,
+      provider: "hf-inference",
+    });
+
+    const result = output.slice(0, 128);
+    imageCache.set(cacheKey, result);
+    return result;
+  } catch (error) {
+    logger.error("Error getting embedding:", error);
+    throw error;
+  }
+};
+
 // Highly optimized upload endpoint
 app.post("/upload", upload.single("image"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: "No image provided" });
   }
 
-  const requestId = Date.now().toString();
-  requestQueue.set(requestId, { status: 'processing' });
-
-  // Set response headers for faster client processing
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Request-ID', requestId);
-
   try {
-    const cacheKey = Buffer.from(req.file.buffer).toString('base64').substring(0, 20);
-    const cachedResult = imageCache.get(cacheKey);
+    // Generate efficient cache key
+    const cacheKey = Buffer.from(req.file.buffer)
+      .toString("base64")
+      .substring(0, 20);
 
+    // Check cache first
+    const cachedResult = imageCache.get(cacheKey);
     if (cachedResult) {
-      requestQueue.delete(requestId);
-      return res.json({ embedding: cachedResult, status: 'completed' });
+      return res.json({ embedding: cachedResult });
     }
 
-    // Parallel processing
-    const [optimizedBuffer, faceDetectionPromise] = await Promise.all([
-      optimizeImage(req.file.buffer),
-      Promise.race([
-        detectFaces(req.file.buffer),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Face detection timeout')), 5000)
-        )
-      ])
-    ]);
+    // Set shorter timeout
+    const timeout = setTimeout(() => {
+      return res.status(408).json({ message: "Request timeout" });
+    }, 10000); // 10 second timeout (reduced from 30s)
 
-    const faceEmbeddings = await faceDetectionPromise;
+    // Validate file size
+    if (req.file.size > 2 * 1024 * 1024) {
+      clearTimeout(timeout);
+      return res
+        .status(400)
+        .json({ message: "Image too large, max 2MB allowed" });
+    }
+
+    // Optimize image more aggressively
+    const optimizedBuffer = await optimizeImage(req.file.buffer);
+
+    // Process face detection with optimized function
+    const faceEmbeddings = await detectFaces(optimizedBuffer);
+
+    clearTimeout(timeout);
 
     if (!faceEmbeddings || faceEmbeddings.length === 0) {
-      requestQueue.delete(requestId);
-      return res.json({ message: "No face detected", status: 'completed' });
+      return res.json({ message: "No face detected" });
     }
 
     const result = Array.from(faceEmbeddings[0]);
-    imageCache.set(cacheKey, result);
-    
-    requestQueue.delete(requestId);
-    return res.json({ embedding: result, status: 'completed' });
 
+    // Cache the result
+    imageCache.set(cacheKey, result);
+
+    res.json({ embedding: result });
   } catch (error) {
-    requestQueue.delete(requestId);
     logger.error("Error processing image:", error);
-    return res.status(500).json({
+    res.status(500).json({
       message: "Error processing image",
       error: error.message,
-      status: 'failed'
     });
   }
 });
@@ -297,91 +272,35 @@ const retryAsync = async (fn, retries = 2, delay = 500) => {
   }
 };
 
-// Enhanced match-face endpoint with reliable response handling
+// Match Face from Pinecone (optimized)
 app.post("/match-face", async (req, res) => {
   const { embedding } = req.body;
-  const requestId = Date.now().toString();
 
   if (!embedding || embedding.length !== 128) {
-    return res.status(400).json({ 
-      message: "Invalid embedding dimension", 
-      requestId,
-      status: 'failed' 
-    });
+    return res.status(400).json({ message: "Embedding dimension must be 128" });
   }
-
-  requestQueue.set(requestId, { status: 'processing' });
 
   try {
-    // Set longer timeout for face matching
-    const matchPromise = retryAsync(
-      async () => {
-        const queryResponse = await index.query({
-          vector: embedding,
-          topK: 1,
-          includeMetadata: true,
-        });
-        
-        // Validate query response
-        if (!queryResponse || !queryResponse.matches) {
-          throw new Error('Invalid query response');
-        }
-        
-        return queryResponse;
-      },
-      3, // number of retries
-      1000 // delay between retries
+    const results = await retryAsync(() =>
+      index.query({
+        vector: embedding,
+        topK: 1,
+        includeMetadata: true,
+      })
     );
 
-    // Wait for response with timeout
-    const matchResult = await Promise.race([
-      matchPromise,
-      new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Match operation timeout')), 10000)
-      )
-    ]);
-
-    // Process match results
-    if (matchResult.matches.length > 0 && matchResult.matches[0].score >= 0.85) {
-      requestQueue.delete(requestId);
-      return res.json({
-        match: matchResult.matches[0].metadata.name,
-        score: matchResult.matches[0].score,
-        requestId,
-        status: 'completed'
+    if (results.matches.length > 0 && results.matches[0].score >= 0.85) {
+      res.json({
+        match: results.matches[0].metadata.name,
+        score: results.matches[0].score,
       });
+    } else {
+      res.json({ message: "No match found" });
     }
-
-    requestQueue.delete(requestId);
-    return res.json({ 
-      message: "No match found", 
-      requestId,
-      status: 'completed'
-    });
-
   } catch (error) {
-    requestQueue.delete(requestId);
-    logger.error("Face matching error:", error);
-    
-    return res.status(500).json({ 
-      message: "Face matching failed", 
-      error: error.message,
-      requestId,
-      status: 'failed'
-    });
+    logger.error("Error querying Pinecone:", error);
+    res.status(500).json({ message: "Internal server error" });
   }
-});
-
-// Add status check endpoint
-app.get("/status/:requestId", (req, res) => {
-  const { requestId } = req.params;
-  const request = requestQueue.get(requestId);
-  
-  if (!request) {
-    return res.json({ status: 'not_found' });
-  }
-  
-  res.json({ status: request.status });
 });
 
 // Error handling middleware (improved)
@@ -393,21 +312,9 @@ app.use((err, req, res, next) => {
 // Initialize server
 const startServer = async () => {
   try {
-    // Clean old logs before starting
-    await cleanOldLogs();
-    
     await loadModels();
     const PORT = process.env.PORT || 5000;
-    
-    // Schedule periodic log cleanup (every 24 hours)
-    setInterval(cleanOldLogs, 24 * 60 * 60 * 1000);
-    
-    const server = app.listen(PORT, () => logger.info(`✅ Server running on port ${PORT}`));
-    
-    // Configure server timeouts
-    server.keepAliveTimeout = 30000;
-    server.headersTimeout = 35000;
-    
+    app.listen(PORT, () => logger.info(`✅ Server running on port ${PORT}`));
   } catch (error) {
     logger.error("Failed to start server:", error);
     process.exit(1);
