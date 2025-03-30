@@ -180,28 +180,83 @@ const getEmbedding = async (text) => {
   }
 };
 
-// Highly optimized upload endpoint
 app.post("/upload", upload.single("image"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ 
+      success: false,
+      message: "No image provided" 
+    });
+  }
+
+  try {
+    // Set timeout for the operation
+    const timeout = setTimeout(() => {
+      return res.status(408).json({ 
+        success: false,
+        message: "Request timeout" 
+      });
+    }, 10000);
+
+    // Validate file size
+    if (req.file.size > 2 * 1024 * 1024) {
+      clearTimeout(timeout);
+      return res
+        .status(400)
+        .json({ 
+          success: false,
+          message: "Image too large, max 2MB allowed" 
+        });
+    }
+
+    // Always process new image
+    const optimizedBuffer = await optimizeImage(req.file.buffer);
+    
+    // Get fresh face embeddings
+    const faceEmbeddings = await detectFaces(optimizedBuffer);
+
+    clearTimeout(timeout);
+
+    if (!faceEmbeddings || faceEmbeddings.length === 0) {
+      return res.json({ 
+        success: false,
+        message: "No face detected in image" 
+      });
+    }
+
+    // Convert to array and ensure we have the correct format
+    const freshEmbeddings = Array.from(faceEmbeddings[0]);
+
+    res.json({ 
+      success: true,
+      embedding: freshEmbeddings 
+    });
+  } catch (error) {
+    logger.error("Error processing image:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error processing image",
+      error: error.message,
+    });
+  }
+});
+
+// Face Registration Endpoint (Combined upload and save)
+app.post("/face-register", upload.single("image"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: "No image provided" });
   }
 
+  const { name } = req.body;
+
+  if (!name) {
+    return res.status(400).json({ message: "Name is required" });
+  }
+
   try {
-    // Generate efficient cache key
-    const cacheKey = Buffer.from(req.file.buffer)
-      .toString("base64")
-      .substring(0, 20);
-
-    // Check cache first
-    const cachedResult = imageCache.get(cacheKey);
-    if (cachedResult) {
-      return res.json({ embedding: cachedResult });
-    }
-
-    // Set shorter timeout
+    // Set timeout for the operation
     const timeout = setTimeout(() => {
       return res.status(408).json({ message: "Request timeout" });
-    }, 10000); // 10 second timeout (reduced from 30s)
+    }, 10000);
 
     // Validate file size
     if (req.file.size > 2 * 1024 * 1024) {
@@ -211,28 +266,45 @@ app.post("/upload", upload.single("image"), async (req, res) => {
         .json({ message: "Image too large, max 2MB allowed" });
     }
 
-    // Optimize image more aggressively
+    // Always process new image
     const optimizedBuffer = await optimizeImage(req.file.buffer);
-
-    // Process face detection with optimized function
+    
+    // Get fresh face embeddings
     const faceEmbeddings = await detectFaces(optimizedBuffer);
 
     clearTimeout(timeout);
 
     if (!faceEmbeddings || faceEmbeddings.length === 0) {
-      return res.json({ message: "No face detected" });
+      return res.json({ 
+        success: false,
+        message: "No face detected in image" 
+      });
     }
 
-    const result = Array.from(faceEmbeddings[0]);
+    // Convert to array and ensure we have the correct format
+    const freshEmbeddings = Array.from(faceEmbeddings[0]);
 
-    // Cache the result
-    imageCache.set(cacheKey, result);
+    // Save to Pinecone with fresh embeddings
+    await index.upsert([{ 
+      id: name, 
+      values: freshEmbeddings, 
+      metadata: { 
+        name,
+        timestamp: new Date().toISOString() // Add timestamp to track when the face was registered
+      } 
+    }]);
 
-    res.json({ embedding: result });
+    res.json({ 
+      success: true,
+      message: "✅ Face registered successfully!", 
+      name: name,
+      embedding: freshEmbeddings 
+    });
   } catch (error) {
-    logger.error("Error processing image:", error);
+    logger.error("Error processing face registration:", error);
     res.status(500).json({
-      message: "Error processing image",
+      success: false,
+      message: "Error processing face registration",
       error: error.message,
     });
   }
@@ -289,7 +361,7 @@ app.post("/match-face", async (req, res) => {
       })
     );
 
-    if (results.matches.length > 0 && results.matches[0].score >= 0.85) {
+    if (results.matches.length > 0 && results.matches[0].score >= 0.90) {
       res.json({
         match: results.matches[0].metadata.name,
         score: results.matches[0].score,
