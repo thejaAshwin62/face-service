@@ -1,2 +1,1 @@
-https://romantic-assuring-starfish.ngrok-free.app
-ngrok http --domain=romantic-assuring-starfish.ngrok-free.app 5500 --host-header=localhost:5500                                                                                                                                 v  
+ngrok http --domain=romantic-assuring-starfish.ngrok-free.app 5500 --host-header=localhost:5500
